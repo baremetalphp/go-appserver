@@ -126,6 +126,33 @@ func BuildPayload(r *http.Request) *server.RequestPayload {
 	}
 }
 
+// mapWorkerErrorToStatus converts worker-level errors into HTTP status codes.
+func mapWorkerErrorToStatus(err error) int {
+	msg := err.Error()
+
+	switch {
+	case strings.Contains(msg, "timeout"):
+		// the php worker timed out handling the request
+		return http.StatusGatewayTimeout //' 504 Gateway Timeout
+	case strings.Contains(msg, "unexpected EOF"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "connection reset"):
+		// Connection to the worker died mid-request
+		return http.StatusBadGateway // 502 Bad Gateway
+
+	default:
+		// Anything else is treated as an internal server error
+		return http.StatusInternalServerError //500
+	}
+}
+
+// writeWorkerError logs and sends an appropriate HTTP error to the client.
+func writeWorkerError(w http.ResponseWriter, err error) {
+	status := mapWorkerErrorToStatus(err)
+	log.Printf("[worker] error (status=%d): %v", status, err)
+	http.Error(w, http.StatusText(status), status)
+}
+
 //
 // -------------------------------------------------------------
 // PROJECT ROOT DISCOVERY (dir containing go.mod)
@@ -207,11 +234,13 @@ func main() {
 
 		// 2) Transform request → payload for PHP worker
 		payload := BuildPayload(r)
+		start := time.Now()
 
 		// 3) Dispatch to either fast or slow pool
 		resp, err := srv.Dispatch(payload)
 		if err != nil {
-			log.Println("Worker error:", err)
+			writeWorkerError(w, err)
+			log.Println("[req %s] %s %s -> worker error: %v", payload.ID, payload.Method, payload.Path, err)
 			http.Error(w, "Worker error: "+err.Error(), 500)
 			return
 		}
@@ -231,12 +260,17 @@ func main() {
 		// Write status
 		status := resp.Status
 		if status == 0 {
-			status = 200
+			status = http.StatusOK
 		}
 		w.WriteHeader(status)
 
 		// Write body
 		_, _ = w.Write([]byte(resp.Body))
+
+		// 5) Log successful request
+		elapsed := time.Since(start)
+		log.Printf("[req %s] %s %s -> %d (%v)",
+			payload.ID, payload.Method, payload.Path, status, elapsed)
 	})
 
 	addr := os.Getenv("APP_SERVER_ADDR")

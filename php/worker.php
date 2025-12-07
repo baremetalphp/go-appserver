@@ -66,6 +66,7 @@ while (true) {
         break;
     }
 
+    
     $lengthArr = unpack("Nlen", $lenData);
     $length    = $lengthArr['len'] ?? 0;
 

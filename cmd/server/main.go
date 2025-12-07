@@ -243,28 +243,47 @@ func loadConfig(projectRoot string) *AppServerConfig {
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
+		log.Printf("[config] no go_appserver.json found at %s, using defaults: %v", cfgPath, err)
 		return defaultConfig()
 	}
 
 	var cfg AppServerConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("[config] invalid go_appserver.json (%s), using defaults: %v", cfgPath, err)
 		return defaultConfig()
 	}
 
+	// Apply defaults / clamps with logging so misconfigurations are obvious.
 	if cfg.FastWorkers <= 0 {
+		log.Printf("[config] fast_workers=%d is invalid, falling back to 4", cfg.FastWorkers)
 		cfg.FastWorkers = 4
 	}
 	if cfg.SlowWorkers < 0 {
+		log.Printf("[config] slow_workers=%d is invalid, falling back to 2", cfg.SlowWorkers)
 		cfg.SlowWorkers = 2
 	}
 	if cfg.RequestTimeoutMs <= 0 {
+		log.Printf("[config] request_timeout_ms=%d is invalid, falling back to 10000ms", cfg.RequestTimeoutMs)
 		cfg.RequestTimeoutMs = 10000
 	}
 	if cfg.MaxRequestsPerWorker <= 0 {
+		log.Printf("[config] max_requests_per_worker=%d is invalid, falling back to 1000", cfg.MaxRequestsPerWorker)
 		cfg.MaxRequestsPerWorker = 1000
 	}
 	if len(cfg.Static) == 0 {
+		log.Printf("[config] no static rules configured, using default static rules")
 		cfg.Static = defaultConfig().Static
+	} else {
+		for i, rule := range cfg.Static {
+			if !strings.HasPrefix(rule.Prefix, "/") {
+				log.Printf("[config] static[%d].prefix=%q does not start with '/', fixing", i, rule.Prefix)
+				cfg.Static[i].Prefix = "/" + rule.Prefix
+			}
+
+			if rule.Dir == "" {
+				log.Printf("[config] static[%d].dir is empty, this rule will be ignored at runtime.", i)
+			}
+		}
 	}
 
 	return &cfg

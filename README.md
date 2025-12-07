@@ -260,5 +260,4 @@ Check:
 ## 📄 License
 
 MIT License.  
-Do whatever you want, just don’t sue us.
-
+You can do whatever you want with this code :)

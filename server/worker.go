@@ -16,19 +16,34 @@ import (
 	"time"
 )
 
+type WorkerState int
+
+const (
+	WorkerIdle WorkerState = iota
+	WorkerBusy
+	WorkerDraining
+	WorkerDead
+)
+
 type Worker struct {
 	cmd            *exec.Cmd
 	stdin          io.WriteCloser
 	stdout         io.ReadCloser
-	mu             sync.Mutex
+	mu             sync.Mutex // protects cmd/stdin/stdout during request I/O
 	baseDir        string
 	dead           bool
-	deadMu         sync.RWMutex
+	deadMu         sync.RWMutex // protects dead flag
 	maxRequests    int
 	requestTimeout time.Duration
 	requestCount   uint64
+
+	stateMu  sync.RWMutex // protects state + inFlight
+	state    WorkerState
+	inFlight int
 }
 
+// NewWorker walks up from the current directory to find go.mod,
+// assumes php/worker.php relative to that, and starts a PHP worker.
 func NewWorker(maxRequests int, requestTimeout time.Duration) (*Worker, error) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -59,15 +74,15 @@ func NewWorker(maxRequests int, requestTimeout time.Duration) (*Worker, error) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		stdin.Close()
+		_ = stdin.Close()
 		return nil, err
 	}
 
 	cmd.Stderr = log.Writer()
 
 	if err := cmd.Start(); err != nil {
-		stdin.Close()
-		stdout.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return nil, err
 	}
 
@@ -79,19 +94,74 @@ func NewWorker(maxRequests int, requestTimeout time.Duration) (*Worker, error) {
 		dead:           false,
 		maxRequests:    maxRequests,
 		requestTimeout: requestTimeout,
+		state:          WorkerIdle,
 	}, nil
 }
 
 func (w *Worker) isDead() bool {
 	w.deadMu.RLock()
-	defer w.deadMu.RUnlock()
-	return w.dead
+	dead := w.dead
+	w.deadMu.RUnlock()
+	return dead
 }
 
 func (w *Worker) markDead() {
 	w.deadMu.Lock()
 	w.dead = true
 	w.deadMu.Unlock()
+
+	w.stateMu.Lock()
+	w.state = WorkerDead
+	w.stateMu.Unlock()
+}
+
+func (w *Worker) setState(state WorkerState) {
+	w.stateMu.Lock()
+	w.state = state
+	w.stateMu.Unlock()
+}
+
+func (w *Worker) getState() WorkerState {
+	w.stateMu.RLock()
+	s := w.state
+	w.stateMu.RUnlock()
+	return s
+}
+
+func (w *Worker) incrInFlight() {
+	w.stateMu.Lock()
+	w.inFlight++
+	w.stateMu.Unlock()
+}
+
+func (w *Worker) decrInFlight() {
+	w.stateMu.Lock()
+	if w.inFlight > 0 {
+		w.inFlight--
+	}
+	w.stateMu.Unlock()
+}
+
+func (w *Worker) getInFlight() int {
+	w.stateMu.RLock()
+	n := w.inFlight
+	w.stateMu.RUnlock()
+	return n
+}
+
+func (w *Worker) startDraining() {
+	w.stateMu.Lock()
+	if w.state != WorkerDead {
+		w.state = WorkerDraining
+	}
+	w.stateMu.Unlock()
+}
+
+func (w *Worker) isDraining() bool {
+	w.stateMu.RLock()
+	draining := w.state == WorkerDraining
+	w.stateMu.RUnlock()
+	return draining
 }
 
 func (w *Worker) restart() error {
@@ -120,15 +190,15 @@ func (w *Worker) restart() error {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		stdin.Close()
+		_ = stdin.Close()
 		return err
 	}
 
 	cmd.Stderr = log.Writer()
 
 	if err := cmd.Start(); err != nil {
-		stdin.Close()
-		stdout.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return err
 	}
 
@@ -140,6 +210,11 @@ func (w *Worker) restart() error {
 	w.dead = false
 	w.deadMu.Unlock()
 
+	w.stateMu.Lock()
+	w.state = WorkerIdle
+	w.inFlight = 0
+	w.stateMu.Unlock()
+
 	atomic.StoreUint64(&w.requestCount, 0)
 
 	log.Println("Restarted PHP worker in", w.baseDir)
@@ -148,6 +223,27 @@ func (w *Worker) restart() error {
 }
 
 func (w *Worker) Handle(payload *RequestPayload) (*ResponsePayload, error) {
+	if w.isDead() {
+		return nil, ErrWorkerDead
+	}
+
+	// don't send new work to draining workers
+	if w.isDraining() {
+		return nil, ErrWorkerDraining
+	}
+
+	w.incrInFlight()
+	w.setState(WorkerBusy)
+	defer func() {
+		w.decrInFlight()
+		if w.getInFlight() == 0 && w.isDraining() {
+			// safe to recycle
+			w.markDead()
+		} else if !w.isDead() {
+			w.setState(WorkerIdle)
+		}
+	}()
+
 	for attempt := 0; attempt < 2; attempt++ {
 		if w.isDead() {
 			if err := w.restart(); err != nil {
@@ -198,12 +294,8 @@ func (w *Worker) handleRequest(payload *RequestPayload) (*ResponsePayload, error
 	}
 	length := uint32(len(jsonBytes))
 
-	header := []byte{
-		byte(length >> 24),
-		byte(length >> 16),
-		byte(length >> 8),
-		byte(length),
-	}
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, length)
 
 	if _, err := w.stdin.Write(header); err != nil {
 		return nil, err
@@ -270,6 +362,21 @@ func (w *Worker) handleRequest(payload *RequestPayload) (*ResponsePayload, error
 
 // Stream sends the request and streams the response frames directly to the client.
 func (w *Worker) Stream(req *RequestPayload, rw http.ResponseWriter) error {
+	if w.isDead() || w.isDraining() {
+		return ErrWorkerDead
+	}
+
+	w.incrInFlight()
+	w.setState(WorkerBusy)
+	defer func() {
+		w.decrInFlight()
+		if w.getInFlight() == 0 && w.isDraining() {
+			w.markDead()
+		} else if !w.isDead() {
+			w.setState(WorkerIdle)
+		}
+	}()
+
 	type result struct {
 		err error
 	}
@@ -317,12 +424,8 @@ func (w *Worker) streamInternal(req *RequestPayload, rw http.ResponseWriter) err
 	}
 	length := uint32(len(jsonBytes))
 
-	header := []byte{
-		byte(length >> 24),
-		byte(length >> 16),
-		byte(length >> 8),
-		byte(length),
-	}
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, length)
 
 	if _, err := w.stdin.Write(header); err != nil {
 		return err
@@ -365,8 +468,21 @@ func (w *Worker) streamInternal(req *RequestPayload, rw http.ResponseWriter) err
 		switch frame.Type {
 		case "headers":
 			if frame.Headers != nil {
-				for k, v := range frame.Headers {
-					rw.Header().Set(k, v)
+				for k, vs := range frame.Headers {
+					if len(vs) == 0 {
+						continue
+					}
+
+					if strings.ToLower(k) == "set-cookie" {
+						// can't join, must be dealt with separately
+						for _, v := range vs {
+							rw.Header().Add(k, v)
+						}
+					} else {
+						// RFC-compliant: join
+						rw.Header().Set(k, strings.Join(vs, ", "))
+					}
+
 				}
 			}
 			if frame.Status != 0 {

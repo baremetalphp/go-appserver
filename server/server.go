@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -164,13 +163,12 @@ func (s *Server) DispatchStream(req *RequestPayload, rw http.ResponseWriter) err
 	}
 
 	w := pool.NextWorker() // you may need to add this helper
+	if w == nil {
+		// no healthy workers in pool
+		return ErrNoWorkers
+	}
 
 	return w.Stream(req, rw)
-}
-
-func (p *WorkerPool) NextWorker() *Worker {
-	i := atomic.AddUint32(&p.next, 1)
-	return p.workers[i%uint32(len(p.workers))]
 }
 
 // -------------------------------------------------------------
@@ -189,6 +187,11 @@ func (s *Server) markAllWorkersDead() {
 
 func (s *Server) ForceRecycleWorkers() {
 	s.markAllWorkersDead()
+}
+
+func (s *Server) DrainWorkers() {
+	s.fastPool.DrainAll()
+	s.slowPool.DrainAll()
 }
 
 // EnableHotReload watches php/ and routes/ under projectRoot and marks all

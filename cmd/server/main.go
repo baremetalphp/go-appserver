@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go-php/server" // IMPORTANT: change this if your module path differs
@@ -276,85 +279,64 @@ func getProjectRoot() string {
 //
 
 func main() {
-	projectRoot := getProjectRoot()
+	root := getProjectRoot()
+	cfg := loadConfig(root)
 
-	// Load go_appserver.json (or defaults)
-	cfg := loadConfig(projectRoot)
-
-	timeout := time.Duration(cfg.RequestTimeoutMs) * time.Millisecond
-
+	// Build server.Server instance
 	slowCfg := server.SlowRequestConfig{
 		RoutePrefixes: cfg.SlowRoutes,
 		Methods:       cfg.SlowMethods,
 		BodyThreshold: cfg.SlowBodyThreshold,
 	}
-
-	// Create worker pools
 	srv, err := server.NewServer(
 		cfg.FastWorkers,
 		cfg.SlowWorkers,
 		cfg.MaxRequestsPerWorker,
-		timeout,
+		time.Duration(cfg.RequestTimeoutMs)*time.Millisecond,
 		slowCfg,
 	)
-
-	http.HandleFunc("/__baremetal/health", func(w http.ResponseWriter, r *http.Request) {
-		summary := srv.Health()
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(summary); err != nil {
-			http.Error(w, "Failed to encode health summary", http.StatusInternalServerError)
-			return
-		}
-	})
-
-	http.HandleFunc("/__baremetal/recycle", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		// For now, this is a brutal "mark all dead" so next requests spawn fresh workers
-		srv.ForceRecycleWorkers() // we'll define this
-
-		w.Header().Set("Content-Type", "application/json")
-
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-			"note":   "all workers marked dead; will respawn on next requests",
-		})
-	})
 	if err != nil {
-		log.Fatal("Failed creating worker pools:", err)
+		log.Fatalf("failed to create server: %v", err)
 	}
-
-	// Hot reload (if enabled)
-	if cfg.HotReload {
-		if err := srv.EnableHotReload(projectRoot); err != nil {
-			log.Println("Hot reload disabled:", err)
-		} else {
-			log.Println("Hot reload enabled")
-		}
-	}
-
-	log.Println("=============================================")
-	log.Println(" BareMetalPHP Go App Server Started :8080")
-	log.Println("=============================================")
-	log.Printf(" Fast workers: %d", cfg.FastWorkers)
-	log.Printf(" Slow workers: %d", cfg.SlowWorkers)
-	log.Printf(" Timeout: %dms", cfg.RequestTimeoutMs)
-	log.Printf(" Max requests/worker: %d", cfg.MaxRequestsPerWorker)
-	log.Println(" Static rules:")
-	for _, rule := range cfg.Static {
-		log.Printf("   %s → %s", rule.Prefix, filepath.Join(projectRoot, rule.Dir))
-	}
-	log.Println("=============================================")
 
 	metrics := NewMetrics()
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	hub := server.NewSSEHub()
 
+	// streaming routes: anything under /stream/ uses DispatchStream
+	mux.HandleFunc("/stream/", func(w http.ResponseWriter, r *http.Request) {
+		// tell php worker we want streaming
+		r.Header.Set("X-Go-Stream", "1")
+		payload := BuildPayload(r)
+		start := time.Now()
+
+		routeKey := r.URL.Path
+		if routeKey == "" {
+			routeKey = "/stream"
+		}
+
+		metrics.StartRequest(routeKey)
+
+		if err := srv.DispatchStream(payload, w); err != nil {
+			elapsed := time.Since(start)
+			metrics.EndRequest(routeKey, elapsed, true)
+			writeWorkerError(w, err)
+			log.Printf("[req %s] %s %s -> stream error: %v", payload.ID, payload.Method, payload.Path, err)
+			return
+		}
+
+		elapsed := time.Since(start)
+		metrics.EndRequest(routeKey, elapsed, false)
+		srv.RecordLatency(payload.Path, elapsed)
+
+		log.Printf("[req %s] %s %s -> streamed (%v)", payload.ID, payload.Method, payload.Path, elapsed)
+	})
+
+	// Main application handler
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// 1) Try static assets first
-		if tryServeStatic(w, r, projectRoot, cfg.Static) {
+		if tryServeStatic(w, r, root, cfg.Static) {
 			return
 		}
 
@@ -362,40 +344,50 @@ func main() {
 		payload := BuildPayload(r)
 		start := time.Now()
 
-		// wire metrics
+		// Metrics: per-route tracking
 		routeKey := r.URL.Path
 		if routeKey == "" {
 			routeKey = "/"
 		}
 		metrics.StartRequest(routeKey)
 
-		// TEMP streaming demo toggle by request header
+		// Optional: streaming path (guarded by header)
 		if r.Header.Get("X-Go-Stream") == "1" {
 			if err := srv.DispatchStream(payload, w); err != nil {
+				elapsed := time.Since(start)
+				metrics.EndRequest(routeKey, elapsed, true)
 				writeWorkerError(w, err)
 				log.Printf("[req %s] %s %s -> stream error: %v", payload.ID, payload.Method, payload.Path, err)
 				return
 			}
+
 			elapsed := time.Since(start)
+			metrics.EndRequest(routeKey, elapsed, false)
 			srv.RecordLatency(payload.Path, elapsed)
 			log.Printf("[req %s] %s %s -> streamed (%v)", payload.ID, payload.Method, payload.Path, elapsed)
 			return
 		}
 
-		// 2) Normal non-streaming path (unchanged)
+		// 3) Normal non-streaming path
 		resp, err := srv.Dispatch(payload)
 		if err != nil {
+			elapsed := time.Since(start)
+			metrics.EndRequest(routeKey, elapsed, true)
 			writeWorkerError(w, err)
 			log.Printf("[req %s] %s %s -> worker error: %v", payload.ID, payload.Method, payload.Path, err)
 			return
 		}
 
+		// If PHP returns 404, give static another chance
 		if resp.Status == http.StatusNotFound {
-			if tryServeStatic(w, r, projectRoot, cfg.Static) {
+			if tryServeStatic(w, r, root, cfg.Static) {
+				elapsed := time.Since(start)
+				metrics.EndRequest(routeKey, elapsed, false)
 				return
 			}
 		}
 
+		// Copy headers
 		for k, v := range resp.Headers {
 			w.Header().Set(k, v)
 		}
@@ -410,9 +402,10 @@ func main() {
 		// Write body
 		_, _ = w.Write([]byte(resp.Body))
 
-		// 5) Log successful request
+		// Final metrics + structured log
 		elapsed := time.Since(start)
 		metrics.EndRequest(routeKey, elapsed, false)
+
 		entry := RequestLog{
 			Time:       time.Now(),
 			ID:         payload.ID,
@@ -422,14 +415,38 @@ func main() {
 			DurationMs: float64(elapsed.Milliseconds()),
 			RemoteAddr: r.RemoteAddr,
 			UserAgent:  r.UserAgent(),
-			// pools will be set if we expose it from server - fil in later ,
 		}
-
 		logRequestJSON(entry)
 	})
 
-	// prometheus style metrics endpoint
-	http.HandleFunc("/__baremetal/metrics", func(w http.ResponseWriter, r *http.Request) {
+	// Health summary: worker pools etc.
+	mux.HandleFunc("/__baremetal/health", func(w http.ResponseWriter, r *http.Request) {
+		summary := srv.Health()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(summary); err != nil {
+			http.Error(w, "Failed to encode health summary", http.StatusInternalServerError)
+			return
+		}
+	})
+
+	// Force recycle: mark all workers dead so they respawn on next requests
+	mux.HandleFunc("/__baremetal/recycle", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		srv.ForceRecycleWorkers()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"note":   "all workers marked dead; will respawn on next requests",
+		})
+	})
+
+	// Metrics endpoint
+	mux.HandleFunc("/__baremetal/metrics", func(w http.ResponseWriter, r *http.Request) {
 		snap := metrics.Snapshot()
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(snap); err != nil {
@@ -437,19 +454,134 @@ func main() {
 		}
 	})
 
+	mux.HandleFunc("/__sse", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		channel := r.URL.Query().Get("channel")
+		if channel == "" {
+			http.Error(w, "missing channel", http.StatusBadRequest)
+			return
+		}
+
+		client := hub.Subscribe(channel)
+		defer hub.Unsubscribe(channel, client)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// initial comment so EventSource opens
+		_, _ = w.Write([]byte(": connected\n\n"))
+		flusher.Flush()
+
+		for {
+			select {
+			case ev := <-client.Ch():
+				if ev.Event != "" {
+					_, _ = w.Write([]byte("event: " + ev.Event + "\n"))
+				}
+				_, _ = w.Write([]byte("data: "))
+				_, _ = w.Write(ev.Data)
+				_, _ = w.Write([]byte("\n\n"))
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			case <-client.Done():
+				return
+			}
+		}
+	})
+
+	// SSE publish endpoint: POST /__sse/publish
+	// Body: { "channel": "foo", "event", "update", "data": { ... } }
+	mux.HandleFunc("/__sse/publish", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var body struct {
+			Channel string      `json:"channel"`
+			Event   string      `json:"event"`
+			Data    interface{} `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if body.Channel == "" {
+			http.Error(w, "missing channel", http.StatusBadRequest)
+			return
+		}
+
+		hub.Publish(body.Channel, body.Event, body.Data)
+		w.WriteHeader(http.StatusAccepted)
+	})
+
+	// Hot reload (if enabled)
+	if cfg.HotReload {
+		if err := srv.EnableHotReload(root); err != nil {
+			log.Println("Hot reload disabled:", err)
+		} else {
+			log.Println("Hot reload enabled")
+		}
+	}
+
+	// Resolve listen address: APP_SERVER_ADDR env or default
 	addr := os.Getenv("APP_SERVER_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
 
-	log.Printf("Go PHP app server listening on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatal("HTTP Server failed:", err)
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
 
-	// Start actual Go HTTP server
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("HTTP Server failed:", err)
+	// Graceful shutdown on SIGINT/SIGTERM
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-shutdownCh
+		log.Println("[shutdown] signal received, draining workers and shutting down HTTP server...")
+
+		// stop taking new requests
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// tell PHP workers to drain (no new jobs, finish in-flight)
+		srv.DrainWorkers()
+
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("[shutdown] http server shutdown error: %v", err)
+		} else {
+			log.Println("[shutdown] http server shut down cleanly")
+		}
+	}()
+
+	// Startup banner / config summary
+	log.Println("=============================================")
+	log.Printf(" BareMetalPHP Go App Server listening on %s", addr)
+	log.Println("=============================================")
+	log.Printf(" Fast workers: %d", cfg.FastWorkers)
+	log.Printf(" Slow workers: %d", cfg.SlowWorkers)
+	log.Printf(" Timeout: %dms", cfg.RequestTimeoutMs)
+	log.Printf(" Max requests/worker: %d", cfg.MaxRequestsPerWorker)
+	log.Println(" Static rules:")
+	for _, rule := range cfg.Static {
+		log.Printf("   %s → %s", rule.Prefix, filepath.Join(root, rule.Dir))
+	}
+	log.Println("=============================================")
+
+	// Start HTTP server (blocks until shutdown)
+	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("[server] listen error: %v", err)
 	}
 }
 

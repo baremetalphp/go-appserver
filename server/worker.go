@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -226,10 +227,7 @@ func (w *Worker) handleRequest(payload *RequestPayload) (*ResponsePayload, error
 			return
 		}
 
-		respLen := (uint32(hdr[0]) << 24) |
-			(uint32(hdr[1]) << 16) |
-			(uint32(hdr[2]) << 8) |
-			uint32(hdr[3])
+		respLen := binary.BigEndian.Uint32(hdr)
 
 		if respLen == 0 || respLen > 10*1024*1024 {
 			resCh <- result{nil, io.ErrUnexpectedEOF}
@@ -344,10 +342,7 @@ func (w *Worker) streamInternal(req *RequestPayload, rw http.ResponseWriter) err
 			return err
 		}
 
-		frameLen := (uint32(hdr[0]) << 24) |
-			(uint32(hdr[1]) << 16) |
-			(uint32(hdr[2]) << 8) |
-			uint32(hdr[3])
+		frameLen := binary.BigEndian.Uint32(hdr)
 
 		if frameLen == 0 || frameLen > 10*1024*1024 {
 			w.markDead()
